@@ -45,6 +45,20 @@ model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
+
+def load_arg_embeddings(path, device):
+    payload = torch.load(path, map_location=device)
+
+    if isinstance(payload, dict) and "refined_embeddings" in payload and "unique_attrs" in payload:
+        attrs = payload["unique_attrs"]
+        refined = payload["refined_embeddings"]
+        return {attr: refined[idx] for idx, attr in enumerate(attrs)}
+
+    if isinstance(payload, dict):
+        return payload
+
+    raise ValueError("Unsupported ARG embedding format. Expected a dict payload.")
+
 def ECE_Loss(num_bins, predictions, confidences, correct):
     #ipdb.set_trace()
     bin_boundaries = torch.linspace(0, 1, num_bins + 1)
@@ -262,6 +276,12 @@ def main_worker(gpu, args, result_dict):
     # Convert the values to lists
     attributes = {key: value.split() for key, value in data.items()}
 
+    arg_embeddings = None
+    if args.use_arg_tca:
+        assert args.arg_embeddings_path is not None, "--arg_embeddings_path is required when --use_arg_tca is enabled"
+        arg_embeddings = load_arg_embeddings(args.arg_embeddings_path, "cpu")
+        print(f"[ARG-TCA] Loaded {len(arg_embeddings)} refined attribute embeddings")
+
 
     if args.cocoop:
         model = get_cocoop(args.arch, args.test_sets, 'cpu', args.n_ctx)
@@ -274,7 +294,17 @@ def main_worker(gpu, args, result_dict):
         # for i in ["a photo of the", "a picture of a", "a picture of the"]:
         #     list_of_models.append(get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx, i))
         # model = get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx, args.ctx_init)
-        model = get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx, args.ctx_init,args.num_attributes,args.multi_gpu,attributes)
+        model = get_coop(
+            args.arch,
+            args.test_sets,
+            args.gpu,
+            args.n_ctx,
+            args.ctx_init,
+            args.num_attributes,
+            args.multi_gpu,
+            attributes,
+            arg_embeddings=arg_embeddings,
+        )
 
         
 
@@ -628,6 +658,8 @@ if __name__ == '__main__':
     parser.add_argument('--beta' , type=float, default=0.0, help='beta for tca')
     parser.add_argument('--num_attributes' , type=int, default=2, help='Number of attributes')
     parser.add_argument('--multi_gpu', action='store_true', help='Use Multi GPU setting or not')
+    parser.add_argument('--use_arg_tca', action='store_true', help='Use ARG-refined attribute embeddings in prompt construction')
+    parser.add_argument('--arg_embeddings_path', type=str, default=None, help='Path to ARG .pt artifact or attribute->embedding dict')
 
     args = parser.parse_args()
     

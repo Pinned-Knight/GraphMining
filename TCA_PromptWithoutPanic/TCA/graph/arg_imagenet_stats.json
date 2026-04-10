@@ -1,0 +1,15 @@
+{
+  "focus_class": "Affenpinscher",
+  "focus_attrs": [
+    "affenpinscher",
+    "dog"
+  ],
+  "subset_class_count": 4,
+  "num_nodes": 56,
+  "num_edges": 3,
+  "semantic_edge_count": 0,
+  "class_edge_count": 3,
+  "avg_degree": 0.10714285714285714,
+  "num_connected_components": 53,
+  "largest_component_size": 4
+}

@@ -79,7 +79,7 @@ class TextEncoder(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, clip_model, classnames, num_attributes, attributes, batch_size=None, n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False):
+    def __init__(self, clip_model, classnames, num_attributes, attributes, batch_size=None, n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False, arg_embeddings=None):
         super().__init__()
         n_cls = len(classnames)
         self.learned_cls = learned_cls
@@ -91,6 +91,7 @@ class PromptLearner(nn.Module):
         self.batch_size = batch_size
         self.num_attributes = num_attributes
         self.attributes = attributes
+        self.arg_embeddings = self._normalize_arg_embeddings(arg_embeddings)
 
         # self.ctx, prompt_prefix = self.reset_prompt(ctx_dim, ctx_init, clip_model)
 
@@ -148,29 +149,45 @@ class PromptLearner(nn.Module):
         if not self.learned_cls:
             classnames = [name.replace("_", " ") for name in classnames]
             name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+            prompt_attributes = []
+            attr_token_ranges = []
             if num_attributes > 0:
                 prompts = []
                 for name in classnames:
                     lst = attributes[name]
                     for attribute in lst[:num_attributes]:
                         prompts.append(prompt_prefix + " " + attribute + " " + name + ".")
+                        prompt_attributes.append(attribute)
+                        attr_len = max(1, len(_tokenizer.encode(attribute)))
+                        attr_start = 1 + n_ctx
+                        attr_token_ranges.append((attr_start, attr_start + attr_len))
             else:
                 prompts = [prompt_prefix + " " + name + "." for name in classnames]
+                prompt_attributes = [None for _ in prompts]
+                attr_token_ranges = [None for _ in prompts]
         else:
             print("Random initialization: initializing a learnable class token")
             cls_vectors = torch.empty(n_cls, 1, ctx_dim, dtype=dtype) # assume each learnable cls_token is only 1 word
             nn.init.normal_(cls_vectors, std=0.02)
             cls_token = "X"
             name_lens = [1 for _ in classnames]
+            prompt_attributes = []
+            attr_token_ranges = []
             if num_attributes > 0:
                 prompts = []
                 for name in classnames:
                     lst = attributes[name]
                     for attribute in lst[:num_attributes]:
                         prompts.append(prompt_prefix + " " + attribute + " " + cls_token + ".")
+                        prompt_attributes.append(attribute)
+                        attr_len = max(1, len(_tokenizer.encode(attribute)))
+                        attr_start = 1 + n_ctx
+                        attr_token_ranges.append((attr_start, attr_start + attr_len))
                       
             else:
                 prompts = [prompt_prefix + " " + cls_token + "." for _ in classnames]
+                prompt_attributes = [None for _ in prompts]
+                attr_token_ranges = [None for _ in prompts]
 
             self.cls_init_state = cls_vectors.detach().clone()
             self.cls = nn.Parameter(cls_vectors) # to be optimized
@@ -178,6 +195,8 @@ class PromptLearner(nn.Module):
         tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+        if self.arg_embeddings and num_attributes > 0:
+            embedding = self._apply_arg_embeddings(embedding, prompt_attributes, attr_token_ranges)
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
@@ -195,6 +214,51 @@ class PromptLearner(nn.Module):
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.classnames = classnames
+        self._prompt_attributes = prompt_attributes
+        self._attr_token_ranges = attr_token_ranges
+
+    def _normalize_arg_embeddings(self, arg_embeddings):
+        if arg_embeddings is None:
+            return {}
+
+        normalized = {}
+        for key, value in arg_embeddings.items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                tensor_value = value.detach().clone()
+            else:
+                tensor_value = torch.tensor(value)
+            tensor_value = tensor_value.to(device=self.device, dtype=self.dtype)
+            if tensor_value.ndim != 1:
+                continue
+            tensor_value = F.normalize(tensor_value, dim=0)
+            normalized[key.strip().lower()] = tensor_value
+        return normalized
+
+    def _apply_arg_embeddings(self, embedding, prompt_attributes, attr_token_ranges):
+        if not self.arg_embeddings:
+            return embedding
+
+        patched_embedding = embedding.clone()
+        max_seq_len = patched_embedding.shape[1]
+        for idx, (attr, token_range) in enumerate(zip(prompt_attributes, attr_token_ranges)):
+            if attr is None or token_range is None:
+                continue
+            attr_key = attr.strip().lower()
+            if attr_key not in self.arg_embeddings:
+                continue
+
+            start, end = token_range
+            start = max(0, min(start, max_seq_len))
+            end = max(start, min(end, max_seq_len))
+            if start == end:
+                continue
+
+            refined = self.arg_embeddings[attr_key].unsqueeze(0).expand(end - start, -1)
+            patched_embedding[idx, start:end, :] = refined
+
+        return patched_embedding
 
     def reset(self):
         ctx_vectors = self.ctx_init_state
@@ -213,27 +277,43 @@ class PromptLearner(nn.Module):
             name_lens = [len(_tokenizer.encode(name)) for name in classnames]
             # Modification
             print(self.num_attributes)
+            prompt_attributes = []
+            attr_token_ranges = []
             if self.num_attributes > 0:
                 prompts = []
                 for name in classnames:
                     lst = self.attributes[name]
                     for attribute in lst[:self.num_attributes]:
                         prompts.append(self.prompt_prefix + " " + attribute + " " + name + ".")
+                        prompt_attributes.append(attribute)
+                        attr_len = max(1, len(_tokenizer.encode(attribute)))
+                        attr_start = 1 + self.n_ctx
+                        attr_token_ranges.append((attr_start, attr_start + attr_len))
             else:
                 prompts = [self.prompt_prefix + " " + name + "." for name in classnames]
+                prompt_attributes = [None for _ in prompts]
+                attr_token_ranges = [None for _ in prompts]
         else:
             cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype) # assume each learnable cls_token is only 1 word
             nn.init.normal_(cls_vectors, std=0.02)
             cls_token = "X"
             name_lens = [1 for _ in classnames]
+            prompt_attributes = []
+            attr_token_ranges = []
             if self.num_attributes > 0:
                 prompts = []
                 for name in classnames:
                     lst = self.attributes[name]
                     for attribute in lst[:self.num_attributes]:
                         prompts.append(self.prompt_prefix + " " + attribute + " " + cls_token + ".")
+                        prompt_attributes.append(attribute)
+                        attr_len = max(1, len(_tokenizer.encode(attribute)))
+                        attr_start = 1 + self.n_ctx
+                        attr_token_ranges.append((attr_start, attr_start + attr_len))
             else:
                 prompts = [self.prompt_prefix + " " + cls_token + "." for _ in classnames]
+                prompt_attributes = [None for _ in prompts]
+                attr_token_ranges = [None for _ in prompts]
             # TODO: re-init the cls parameters
             # self.cls = nn.Parameter(cls_vectors) # to be optimized
             self.cls_init_state = cls_vectors.detach().clone()
@@ -245,6 +325,8 @@ class PromptLearner(nn.Module):
         with torch.no_grad():
             # embedding.append(clip.token_embedding(tokenized_prompt).type(self.dtype))
             embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
+        if self.arg_embeddings and self.num_attributes > 0:
+            embedding = self._apply_arg_embeddings(embedding, prompt_attributes, attr_token_ranges)
         # mean_embedding = sum(embedding) / len(embedding)
         # mean_tokenized_prompts = sum(tokenized_prompts) / len(tokenized_prompts)
         # self.token_prefix = mean_embedding[:, :1, :]
@@ -256,6 +338,8 @@ class PromptLearner(nn.Module):
         # self.tokenized_prompts = mean_tokenized_prompts
         self.tokenized_prompts = tokenized_prompts
         self.classnames = classnames
+        self._prompt_attributes = prompt_attributes
+        self._attr_token_ranges = attr_token_ranges
 
     def forward(self, init=None):
         # the init will be used when computing CLIP directional loss
@@ -357,7 +441,7 @@ class PromptLearner(nn.Module):
 
 class ClipTestTimeTuning(nn.Module):
     def __init__(self, device, classnames, batch_size, multi_gpu, num_attributes, attributes, criterion='cosine', arch="ViT-L/14",
-                        n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False):
+                        n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False, arg_embeddings=None):
         super(ClipTestTimeTuning, self).__init__()
         # device = torch.device("cuda:2")
         self.num_attributes = num_attributes
@@ -378,7 +462,7 @@ class ClipTestTimeTuning(nn.Module):
 
         self.logit_scale = clip.logit_scale.data
         # prompt tuning
-        self.prompt_learner = PromptLearner(clip, classnames, num_attributes, attributes, batch_size, n_ctx, ctx_init, ctx_position, learned_cls)
+        self.prompt_learner = PromptLearner(clip, classnames, num_attributes, attributes, batch_size, n_ctx, ctx_init, ctx_position, learned_cls, arg_embeddings)
         self.criterion = criterion
         
     # @property
@@ -495,7 +579,7 @@ class ClipTestTimeTuning(nn.Module):
             return self.inference(input)
 
 
-def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_attributes, multi_gpu, attributes, learned_cls=False):
+def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_attributes, multi_gpu, attributes, arg_embeddings=None, learned_cls=False):
     if test_set in fewshot_datasets:
         classnames = eval("{}_classes".format(test_set.lower()))
     elif test_set == 'bongard':
@@ -507,7 +591,7 @@ def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_attributes, multi
         classnames = imagenet_classes
 
     model = ClipTestTimeTuning(device, classnames, None, multi_gpu, num_attributes, attributes, arch=clip_arch,
-                            n_ctx=n_ctx, ctx_init=ctx_init, learned_cls=learned_cls)
+                            n_ctx=n_ctx, ctx_init=ctx_init, learned_cls=learned_cls, arg_embeddings=arg_embeddings)
 
     return model
 
